@@ -83,6 +83,7 @@ static const std::unordered_map<std::string,
   {"KICK", {&IrcClient::on_kick, {3, 0}}},
   {"INVITE", {&IrcClient::on_invite, {2, 0}}},
   {"CAP", {&IrcClient::on_cap, {3, 0}}},
+  {"BATCH", {&IrcClient::on_batch, {1, 0}}},
 #ifdef WITH_SASL
   {"AUTHENTICATE", {&IrcClient::on_authenticate, {1, 0}}},
   {"900", {&IrcClient::on_sasl_login, {3, 0}}},
@@ -287,7 +288,10 @@ void IrcClient::on_connected()
 
   this->send_gateway_message("Connected to IRC server"s + (this->use_tls ? " (encrypted)": "") + ".");
 
+  this->capabilities["batch"] = {[]{}, []{}};
+  this->capabilities["message-tags"] = {[]{}, []{}};
   this->capabilities["multi-prefix"] = {[]{}, []{}};
+  this->capabilities["draft/multiline"] = {[]{}, []{}};
 
 #ifdef USE_DATABASE
   auto options = Database::get_irc_server_options(this->bridge.get_bare_jid(),
@@ -416,12 +420,34 @@ void IrcClient::parse_in_buffer(const size_t)
                         "”: ", args_size);
           else
             {
-              const auto& cb = it->second.first;
-              try {
-                (this->*(cb))(message);
-              } catch (const std::exception& e) {
-                log_error("Unhandled exception: ", e.what());
-              }
+              bool added_to_batch = false;
+              if (this->has_capability("batch"))
+                {
+                  auto it_tags = message.tags.find("batch");
+                  if (it_tags != message.tags.end())
+                      if (it_tags->second.has_value())
+                        {
+                          auto it_batches = this->batches.find(it_tags->second.value());
+                          if (it_batches != this->batches.end())
+                            {
+                              auto message_tags = message.tags;
+                              auto message_prefix = message.prefix;
+                              auto message_command = message.command;
+                              auto message_arguments = message.arguments;
+                              it_batches->second.second.emplace_back(std::move(message_tags), std::move(message_prefix), std::move(message_command), std::move(message_arguments));
+                              added_to_batch = true;
+                            }
+                        }
+                }
+              if (!added_to_batch)
+                {
+                  const auto& cb = it->second.first;
+                  try {
+                    (this->*(cb))(message);
+                  } catch (const std::exception& e) {
+                    log_error("Unhandled exception: ", e.what());
+                  }
+                }
             }
         }
       else
@@ -441,6 +467,16 @@ void IrcClient::actual_send(std::pair<IrcMessage, MessageCallback>&& message_pai
   const MessageCallback& callback = message_pair.second;
    log_debug("IRC SENDING: (", this->get_hostname(), ") ", message);
     std::string res;
+    if (!message.tags.empty())
+      {
+        res += "@";
+        for (auto& tag: message.tags)
+            if (tag.second.has_value())
+                res += tag.first + "=" + tag.second.value() + ";";
+            else
+                res += tag.first + ";";
+        res.back() = ' ';
+      }
     if (!message.prefix.empty())
       res += ":" + message.prefix + " ";
     res += message.command;
@@ -604,6 +640,22 @@ void IrcClient::on_pong(const IrcMessage&)
 void IrcClient::send_ping_command()
 {
   this->send_message(IrcMessage("PING", {"biboumi"}));
+}
+
+void IrcClient::send_batch(const std::string& reference_tag, const std::string& type, const std::vector<std::string>& parameters, std::vector<IrcMessage>& messages, MessageCallback callback)
+{
+  std::vector<std::string> args;
+  args.push_back("+" + reference_tag);
+  args.push_back(type);
+  for (const std::string& parameter: parameters)
+    args.push_back(parameter);
+  this->send_message(IrcMessage("BATCH", std::move(args)));
+  for (IrcMessage& message: messages)
+    {
+      message.tags["batch"] = reference_tag;
+      this->send_message(std::move(message));
+    }
+  this->send_message(IrcMessage("BATCH", {"-" + reference_tag}), callback);
 }
 
 void IrcClient::forward_server_message(const IrcMessage& message)
@@ -1351,11 +1403,16 @@ void IrcClient::on_cap(const IrcMessage &message)
         }
       Capability& capability = it->second;
       if (sub_command == "ACK")
-        capability.on_ack();
+        {
+          capability.on_ack();
+          this->enabled_capabilities.insert(it->first);
+        }
       else if (sub_command == "NACK")
-        capability.on_nack();
+          capability.on_nack();
       this->capabilities.erase(it);
     }
+  for (const auto& batch: this->batches)
+    log_debug("Batch: ", batch.first, " exists");
   if (this->capabilities.empty())
     this->cap_end();
 }
@@ -1418,4 +1475,86 @@ void IrcClient::cap_end()
 #endif
   this->send_message({"CAP", {"END"}});
   this->bridge.on_irc_client_connected(this->get_hostname());
+}
+
+bool IrcClient::has_capability(const std::string& capability)
+{
+    auto it = this->enabled_capabilities.find(capability);
+    return it != this->enabled_capabilities.end();
+}
+
+void IrcClient::on_batch(const IrcMessage& message)
+{
+    if (message.arguments[0][0] == '+')
+      {
+        if (message.arguments.size() < 2)
+            return;
+        if (message.arguments[1] == "draft/multiline" && message.arguments.size() != 3)
+            return;
+        this->batches.emplace(message.arguments[0].substr(1), std::make_pair(std::make_pair(message.prefix, message.arguments), std::vector<IrcMessage>()));
+      }
+    else if (message.arguments[0][0] == '-')
+      {
+        const std::string reference_tag = message.arguments[0].substr(1);
+        this->process_batch(reference_tag);
+        this->batches.erase(reference_tag);
+      }
+    return;
+}
+
+void IrcClient::process_batch(const std::string& reference_tag)
+{
+    auto it = this->batches.find(reference_tag);
+    if (it == this->batches.end())
+        return;
+    if (it->second.first.second[1] == "draft/multiline")
+      {
+        const IrcUser user(it->second.first.first);
+        const std::string nick = user.nick;
+        Iid iid;
+        iid.set_local(it->second.first.second[2]);
+        iid.set_server(this->hostname);
+        bool muc = true;
+        if (!this->get_channel(iid.get_local())->joined)
+          {
+            iid.type = Iid::Type::User;
+            iid.set_local(nick);
+            muc = false;
+          }
+        else
+            iid.type = Iid::Type::Channel;
+
+        std::string body;
+        for (const IrcMessage& message: it->second.second)
+          {
+            auto it_tags = message.tags.find("draft/multiline-concat");
+            if (it_tags == message.tags.end())
+                body += "\n" + message.arguments[1];
+            else
+                body += message.arguments[1];
+          }
+        if (body.find_first_not_of("\n") == std::string::npos)
+            // Empty message
+            return;
+        this->bridge.send_message(iid, nick, body, muc);
+      }
+    else
+      {
+        for (const IrcMessage& message: it->second.second)
+          {
+            auto it_callback = irc_callbacks.find(message.command);
+            if (it_callback == irc_callbacks.end())
+                continue;
+            const auto& cb = it_callback->second.first;
+            try
+              {
+                (this->*(cb))(message);
+              }
+            catch (const std::exception& e)
+              {
+                log_error("Unhandled exception: ", e.what());
+              }
+          }
+      }
+    return;
 }

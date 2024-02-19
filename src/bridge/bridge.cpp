@@ -13,6 +13,8 @@
 #include <database/database.hpp>
 #include "result_set_management.hpp"
 #include <algorithm>
+#include <cstring>
+#include <utils/string.hpp>
 
 using namespace std::string_literals;
 
@@ -220,6 +222,64 @@ void Bridge::send_channel_message(const Iid& iid, const std::string& body, std::
   std::vector<std::string> lines = utils::split(body, '\n', true);
   if (lines.empty())
     return ;
+
+  if (irc->has_capability("draft/multiline"))
+    {
+      std::string uuid;
+      const auto xmpp_body = this->make_xmpp_body(body);
+#ifdef USE_DATABASE
+      if (this->record_history)
+          uuid = Database::store_muc_message(this->get_bare_jid(), iid.get_local(), iid.get_server(), std::chrono::system_clock::now(),
+                                             std::get<0>(xmpp_body), irc->get_own_nick());
+#else
+      uuid = utils::gen_uuid();
+#endif
+
+      IrcChannel* channel = irc->get_channel(iid.get_local());
+      if (!channel->joined)
+        {
+          log_warning("Cannot send message to channel ", iid.get_local(), ", it is not joined");
+          return;
+        }
+
+      std::vector<IrcMessage> messages;
+      for (const std::string& line: lines)
+        {
+          constexpr auto max_username_size = 10;
+          constexpr auto max_hostname_size = 63;
+          const auto line_size = 512 - 1 - ::strlen("batch=") - uuid.length() - 1 - ::strlen("draft/multiline-concat") - 1 -
+                                 irc->get_own_nick().size() - max_username_size - max_hostname_size -
+                                 ::strlen(":!@ PRIVMSG ") - iid.get_local().length() - ::strlen(" :\r\n");
+          const auto privmsgs = cut(line, line_size);
+          bool first = true;
+          for (const auto& privmsg: privmsgs)
+            {
+              if (first)
+                {
+                  messages.push_back(IrcMessage({}, std::move(std::string()), "PRIVMSG", {iid.get_local(), privmsg}));
+                  first = false;
+                }
+              else
+                  messages.push_back(IrcMessage({{"draft/multiline-concat", {}}}, std::move(std::string()), "PRIVMSG", {iid.get_local(), privmsg}));
+            }
+        }
+
+      MessageCallback mirror_to_all_resources = [this, iid, uuid, nodes_to_reflect, body](const IrcClient* irc, const IrcMessage&) {
+        for (const auto& resource: this->resources_in_chan[iid.to_tuple()])
+          {
+            auto stanza = this->xmpp.make_muc_message(std::to_string(iid), irc->get_own_nick(), this->make_xmpp_body(body),
+                                                       this->user_jid + "/"
+                                                       + resource, uuid, uuid);
+            for (const auto& node: nodes_to_reflect)
+                stanza.add_child(node);
+            this->xmpp.send_stanza(stanza);
+          }
+      };
+
+      irc->send_batch(uuid, "draft/multiline", {iid.get_local()}, messages, std::move(mirror_to_all_resources));
+      return;
+    }
+
   bool first = true;
   for (const std::string& line: lines)
     {
